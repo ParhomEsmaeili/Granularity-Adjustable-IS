@@ -1,6 +1,6 @@
 import os 
 import sys 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 #######
 import logging
 import os.path
@@ -60,7 +60,7 @@ class Tester(object):
         self.prompt_encoder.eval()
         self.mask_decoder.eval()
 
-        if self.args.data == 'lits':
+        if self.args.data == 'lits': #They do this because the LiTs dataset has instances with multiple tumours in the liver...... they're computing metrics in the resampled domain and comparing to those which are not.
             loss = self.validater_sliding_window(epoch_num)
         else:
             loss = self.validater(epoch_num)
@@ -170,7 +170,7 @@ class Tester(object):
             # Calculate the 95% CI
             ci_lower = mean - margin_of_error
             ci_upper = mean + margin_of_error
-            self.logger.info("- ci_lower dice: " + str(ci_lower) + "- ci_lower dice: " + str(ci_upper))
+            self.logger.info("- ci_lower dice: " + str(ci_lower) + "- ci_upper dice: " + str(ci_upper))
 
         return dice_summary
 
@@ -271,7 +271,7 @@ class Tester(object):
             # Calculate the 95% CI
             ci_lower = mean - margin_of_error
             ci_upper = mean + margin_of_error
-            self.logger.info("- ci_lower dice: " + str(ci_lower) + "- ci_lower dice: " + str(ci_upper))
+            self.logger.info("- ci_lower dice: " + str(ci_lower) + "- ci_upper dice: " + str(ci_upper))
 
         return loss_summary
 

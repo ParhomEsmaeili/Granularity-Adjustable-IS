@@ -42,3 +42,7 @@ venv.bak/
 #Ignoring the implementation files so that the model versions and segmentation outputs are not required.
 
 src/implementation
+
+#Ignoring the predictions folders
+
+src/prism_prediction
