@@ -60,7 +60,7 @@ class Tester(object):
         self.prompt_encoder.eval()
         self.mask_decoder.eval()
 
-        if self.args.data == 'lits': #They do this because the LiTs dataset has instances with multiple tumours in the liver...... they're computing metrics in the resampled domain and comparing to those which are not.
+        if self.args.data == 'lits': #They do this because the LiTs dataset has instances with multiple tumours in the liver...... but they're computing metrics in the resampled domain and comparing to those which are not.
             loss = self.validater_sliding_window(epoch_num)
         else:
             loss = self.validater(epoch_num)
@@ -90,11 +90,15 @@ class Tester(object):
 
                     if torch.count_nonzero(label) == 0:
                         print('found empty patch')
-                        masks = torch.zeros([1, 1, 128, 128, 128])
+                        masks = torch.zeros([1, 1, 128, 128, 128]) 
+                        #NOTE: Original PRISM Code - This is absolutely not a valid strategy for assessing performance with a sliding window. A proper heuristic is needed for local patch fusion.
                     else:
                         # _, masks = self._interaction(self.sam, image, label, iter_nums=self.args.iter_nums, train=False, return_each_iter=True)
                         _, masks = self._interaction(self.sam, image, label, iter_nums=self.args.iter_nums, train=False)
+                        #NOTE This approach appears to perform the iterative segmentation within each patch.... not sure if this is how a user would actually use this.
+                        #Potentially unfair when compared against methods which perform iterative seg. on the ENTIRE image (hence distributing clicks more across lesions)
 
+                        #NOTE: This is also in direct conflict with generation of iterative segmentation results.
                     aggregator.add_batch(masks, locations)
                 masks_iter_final = aggregator.get_output_tensor()
                 mean_dice_sub = self.get_dice_score(torch.sigmoid(masks_iter_final), subject.label.data)
