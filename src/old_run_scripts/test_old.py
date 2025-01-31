@@ -1,12 +1,12 @@
 import os 
 import sys 
-sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
+sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 #######
 import logging
 import os.path
 import torch
-from utils.util import setup_logger
-from config.config_args import *
+from src.utils.util import setup_logger
+from src.config.config_args import *
 import numpy as np
 from torch.backends import cudnn
 from src.config.config_setup import build_model, get_dataloader
@@ -17,6 +17,7 @@ from src.utils import scribble, boundary_selection
 import torchio as tio
 import surface_distance
 from surface_distance import metrics
+from src.utils.util import save_csv
 
 def init_seeds(seed=0, cuda_deterministic=True):
     random.seed(seed)
@@ -434,7 +435,7 @@ class Tester(object):
             # FIXME refine or not
             if self.args.refine and self.args.refine_test:
                 mask_refine, error_map = self.sam.mask_decoder.refine(image, mask_best, [self.click_points, self.click_labels], mask_best.detach())
-                print('dice before refine {} and after {}'.format(
+                self.logger.info('dice before refine {} and after {}'.format(
                     self.get_dice_score(torch.sigmoid(mask_best), label),
                     self.get_dice_score(torch.sigmoid(mask_refine), label))
                 )
@@ -442,6 +443,7 @@ class Tester(object):
 
             prev_masks = mask_best
             dice = self.get_dice_score(torch.sigmoid(prev_masks).cpu().numpy(), label.cpu().numpy())
+
             print('---')
             print(f'Dice: {dice:.4f}, pred_dice: {pred_best_dice}, label: {labels_input}')
 

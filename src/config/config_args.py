@@ -56,6 +56,15 @@ parser.add_argument('--no_detach', action="store_true")
 parser.add_argument('--refine_test', action="store_true")
 
 parser.add_argument('--dynamic', action="store_true")
+parser.add_argument('--input_granular_bool', action="store_true")
+parser.add_argument('--output_granular_bool', action='store_true')
+parser.add_argument('--input_sparse_bool', action='store_true') # Output granularity bool is not provided because it is always assumed to be dense mask.
+parser.add_argument('--gran_inp_heuristic', action="store_true")
+parser.add_argument('--gran_out_heuristic', action='store_true')
+parser.add_argument('--gran_weightmap_types', type=str, default='["Ellipsoid"]')
+parser.add_argument('--gran_fixed_param', type=str, default='{"input":{"points": {"Ellipsoid":[10,10,10]}, "scribbles": {"Ellipsoid":[10,10,10]}}, "output":{"points":{"Ellipsoid":[10,10,10]}, "scribbles":{"Ellipsoid":[10,10,10]}}}')
+# parser.add_argument('--out_granular_param',type=dict, default={'Ellipsoid':[10,10,10]})
+parser.add_argument('--scribbles_separate', action="store_true")
 parser.add_argument('--efficient_scribble', action="store_true")
 parser.add_argument("--use_sam3d_turbo", action="store_true")
 

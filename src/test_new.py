@@ -1,5 +1,6 @@
 import os 
 import sys 
+import json
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 #######
 import logging
@@ -17,6 +18,10 @@ from src.utils import scribble, boundary_selection
 import torchio as tio
 import surface_distance
 from surface_distance import metrics
+from src.utils.util import save_csv
+from src.utils.mask_generation_utils.guidance_points_utils import reformat_prompt_and_gen_param 
+from src.utils.mask_generation_utils.metric_mask_generator_utils import MaskGenerator as point_mask
+from skimage.measure import label as connected_comp
 
 def init_seeds(seed=0, cuda_deterministic=True):
     random.seed(seed)
@@ -98,8 +103,8 @@ class Tester(object):
                         #NOTE This approach appears to perform the iterative segmentation within each patch.... not sure if this is how a user would actually use this.
                         #Potentially unfair when compared against methods which perform iterative seg. on the ENTIRE image (hence distributing clicks more across lesions)
 
-                        #NOTE: This is also in direct conflict with generation of iterative segmentation results. It is somewhat representative of user behaviour wrt
-                        #the fact that a user would focus on segmentation a specific area at a time in all likelihood.
+                        #NOTE: This is also in direct conflict with standard generation of iterative segmentation results. But, it is somewhat representative of user behaviour wrt
+                        #the fact that a user would focus on segmentation of one specific area at a time in all likelihood.
                     aggregator.add_batch(masks, locations)
                 masks_iter_final = aggregator.get_output_tensor()
                 mean_dice_sub = self.get_dice_score(torch.sigmoid(masks_iter_final), subject.label.data)
@@ -286,8 +291,17 @@ class Tester(object):
 
         batch_points = []
         batch_labels = []
-        # dice_list = []
+        batch_parametrisations = []
 
+
+        output_batch_points = []
+        output_batch_parametrisations = []
+        # dice_list = []
+        
+        # if self.args.scribbles_separate:
+        # batch_scribbles = [] 
+        # batch_scribbles_labels = [] 
+    
         pred_masks = (prev_seg > mask_threshold)
         true_masks = (gt_semantic_seg > 0)
         fn_masks = torch.logical_and(true_masks, torch.logical_not(pred_masks))
@@ -298,13 +312,16 @@ class Tester(object):
         #to_point_mask = fn_masks
         for i in range(gt_semantic_seg.shape[0]):
             bp_list, bl_list = [], []
+            # if self.args.scribbles_separate:
+            bp_scribble_list, bl_scribble_list = [], []
+
             points = torch.argwhere(to_point_mask[i])
             if self.args.num_clicks > len(points):
-                click_size = len(points)
+                click_size = len(points) 
             else:
                 click_size = self.args.num_clicks
 
-            dynamic_size = random.randint(1, click_size) if self.args.dynamic else click_size
+            dynamic_size = random.randint(1, click_size) if self.args.dynamic else click_size #Size here refers to the quantity of clicks.
 
             point_index = np.random.choice(len(points), size=dynamic_size, replace=False)
             points_select = points[point_index]  # each row tensor([0, x, y, z]), size --> num_clicks x 4
@@ -343,56 +360,188 @@ class Tester(object):
 
                 scribble_mask_fg = create_scribble_mask(scribble_type, fg)
                 #fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)[:, 0: 100, :]  # for computation only
-                fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)
-                if self.args.efficient_scribble:
-                    fg_coors = fg_coors[:, 0: 10000, :]  # for computation only# for computation only
-                fg_coors_label = torch.ones(1, fg_coors.size(1))
-                bp_list.append(fg_coors)
-                bl_list.append(fg_coors_label)
+                
+                efficient_scribble_upper_lim = 10000
+
+                if self.args.scribbles_separate: #If we want to treat scribbles separately to points for prompt granularity
+                    #We extract the connected scribbles, and split into a list of scribble coords. 
+                    fg_separated_scribble_map, fg_num_scribble = connected_comp(scribble_mask_fg.clone().detach().cpu()[0], return_num=True, connectivity=scribble_mask_fg.ndim - 1)
+                    #Convert to torch tensor on device
+                    torch_separated_scribbles = torch.from_numpy(fg_separated_scribble_map).to(self.args.device)
+                    #Unsqueeze such that the coords are in 1 x N_p x n_dim format.
+                    fg_scribbles_list_coors = [torch.argwhere(torch_separated_scribbles == i).unsqueeze(0) for i in range(1, fg_num_scribble + 1)]
+                
+                    if self.args.efficient_scribble:
+                        scribble_total = 0
+                        for index, scribble_sub in enumerate(fg_scribbles_list_coors):
+                            scribble_total += scribble_sub.shape[1]
+                            if scribble_total >= efficient_scribble_upper_lim:
+                                break 
+                        fg_scribbles_list_coors = fg_scribbles_list_coors[:index + 1]
+                    fg_scribbles_list_label = [torch.ones(1, fg_scribble_coors.shape[1]) for fg_scribble_coors in fg_scribbles_list_coors] 
+                    
+                    bp_scribble_list += fg_scribbles_list_coors 
+                    bl_scribble_list += fg_scribbles_list_label 
+                else:
+                    #If we do not separate, then there is no requirement for the scribbles to be treated any different to normal points. 
+                    fg_coors = torch.argwhere(scribble_mask_fg)[:, 1:].unsqueeze(0)
+
+                    if self.args.efficient_scribble:
+                        fg_coors = fg_coors[:, 0: efficient_scribble_upper_lim, :]  # for computation only# for computation only
+                
+
+                    fg_coors_label = torch.ones(1, fg_coors.size(1)) 
+                    bp_list.append(fg_coors)
+                    bl_list.append(fg_coors_label)
+                    #This will produce a structure [1 x 1 N_dim, ...., 1 x N_p_scrib x N_dim] 
+
                 # x,y,z = bp_list[-1][0, 99, 0], bp_list[-1][0, 99, 1], bp_list[-1][0, 99, 2]
                 # print(gt_semantic_seg[i, 0, x,y,z])
 
                 #if sample_method == 'default':
                 if torch.count_nonzero(fp_masks) > 0:
                     scribble_mask_bg = create_scribble_mask(scribble_type, bg)
-                    bg_coors = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)
-                    if self.args.efficient_scribble:
-                        bg_coors = bg_coors[:, 0: 10000, :]
-                    bg_coors_label = torch.zeros(1, bg_coors.size(1))
-                    bp_list.append(bg_coors)
-                    bl_list.append(bg_coors_label)
 
-            batch_points.append(torch.cat(bp_list, dim=1))
-            batch_labels.append(torch.cat(bl_list, dim=1))
+                    if self.args.scribbles_separate: #If we want to treat scribbles separately to points for prompt granularity
+                        #We extract the connected scribbles, and split into a list of scribble coords. 
+                        bg_separated_scribble_map, bg_num_scribble = connected_comp(scribble_mask_bg.clone().detach().cpu()[0], return_num=True, connectivity=scribble_mask_bg.ndim - 1)
+                        #Convert to torch tensor on device
+                        torch_separated_scribbles = torch.from_numpy(bg_separated_scribble_map).to(self.args.device)
+                        #Unsqueeze such that the coords are in 1 x N_p x n_dim format.
+                        bg_scribbles_list_coors = [torch.argwhere(torch_separated_scribbles == i).unsqueeze(0) for i in range(1, bg_num_scribble + 1)]
+                    
+                        if self.args.efficient_scribble:
+                            scribble_total = 0
+                            for index, scribble_sub in enumerate(bg_scribbles_list_coors):
+                                scribble_total += scribble_sub.shape[1]
+                                if scribble_total >= efficient_scribble_upper_lim:
+                                    break 
+                            bg_scribbles_list_coors = bg_scribbles_list_coors[:index + 1]
+                        bg_scribbles_list_label = [torch.ones(1, bg_scribble_coors.shape[1]) for bg_scribble_coors in bg_scribbles_list_coors] 
+                        
+                        bp_scribble_list += bg_scribbles_list_coors 
+                        bl_scribble_list += bg_scribbles_list_label
+                    
+                    else:
+                        bg_coors = torch.argwhere(scribble_mask_bg)[:, 1:].unsqueeze(0)
+                        if self.args.efficient_scribble:
+                            bg_coors = bg_coors[:, 0: 10000, :]
+                        bg_coors_label = torch.zeros(1, bg_coors.size(1))
+                        bp_list.append(bg_coors)
+                        bl_list.append(bg_coors_label)
 
-            smallest_n = min(tensor.size(1) for tensor in batch_labels)
-            batch_points = [tensor[:, :smallest_n] if tensor.size(1) > smallest_n else tensor for tensor in
-                            batch_points]
-            batch_labels = [tensor[:, :smallest_n] if tensor.size(1) > smallest_n else tensor for tensor in
-                            batch_labels]
+            #Extract the spatial granularity information for the input and output masks
+            gran_param_dict = json.loads(self.args.gran_fixed_param)
+            gran_weightmap_types = json.loads(self.args.gran_weightmap_types)
+            class_config = {'tumour':1, 'background':0}
 
+            if self.args.gran_inp_heuristic or self.args.gran_out_heuristic:
+                #Two different circumstances: Input & Output heuristic (Same for both), Input heuristic - fixed output mask
+                pass 
+            else:
+                if self.args.input_granular_bool:
+                    if self.args.input_sparse_bool:
+                        input_info = reformat_prompt_and_gen_param(sparse_dense='Sparse', 
+                                                    param_heuristic_bool=False, 
+                                                    weightmap_types=gran_weightmap_types, 
+                                                    points_set=bp_list, 
+                                                    scribbles_set=bp_scribble_list, 
+                                                    points_label_set=bl_list, 
+                                                    scribbles_label_set=bl_scribble_list, 
+                                                    guidance_parametrisation=gran_param_dict['input'])
+                        batch_points.append(input_info['sparse_points'])
+                        batch_labels.append(input_info['sparse_labels'])
+                        batch_parametrisations.append(input_info['sparse_parametrisations'])
+
+                    else:
+                        input_info = reformat_prompt_and_gen_param(sparse_dense='Dense', 
+                                                    param_heuristic_bool=False, 
+                                                    weightmap_types=gran_weightmap_types, 
+                                                    points_set=bp_list, 
+                                                    scribbles_set=bp_scribble_list, 
+                                                    points_label_set=bl_list, 
+                                                    scribbles_label_set=bl_scribble_list, 
+                                                    guidance_parametrisation=gran_param_dict['input'])
+                        batch_points.append(input_info['dense_points'])
+                        batch_parametrisations.append(input_info['dense_parametrisations'])
+                else:
+                    #No input granularity parametrisation, we still need the points!
+                    batch_points.append(torch.cat(bp_list + bp_scribble_list, dim=1))
+                    batch_labels.append(torch.cat(bl_list + bl_scribble_list, dim=1))       
+
+                if self.args.output_granular_bool:
+                    output_info = reformat_prompt_and_gen_param(sparse_dense='Dense', 
+                                                param_heuristic_bool=False, 
+                                                weightmap_types=gran_weightmap_types, 
+                                                points_set=bp_list, 
+                                                scribbles_set=bp_scribble_list, 
+                                                points_label_set=bl_list, 
+                                                scribbles_label_set=bl_scribble_list, 
+                                                guidance_parametrisation=gran_param_dict['output'], 
+                                                class_config=class_config)
+                
+                    output_batch_points.append(output_info['dense_points'])
+                    output_batch_parametrisations.append(output_info['dense_parametrisations'])
+           
             # Check the shapes of the adjusted tensors
             for i, tensor in enumerate(batch_points):
                 print(f"Tensor {i + 1} shape: {tensor.shape}")
+            
+           
 
+        #The implementation here will ensure that a consistent quantity of points is provided across the batch 
+        # (not really relevant for test time, but possibly relevant for train.)
 
-        return batch_points, batch_labels
+        # smallest_n = min(tensor.size(1) for tensor in batch_labels)
+        # batch_points = [tensor[:, :smallest_n] if tensor.size(1) > smallest_n else tensor for tensor in
+        #                 batch_points]
+        # batch_labels = [tensor[:, :smallest_n] if tensor.size(1) > smallest_n else tensor for tensor in
+        #                     batch_labels]
 
-    def get_points(self, prev_masks, label):
-        batch_points, batch_labels = self.get_next_click3D_torch_2(prev_masks, label)
+        return batch_points, batch_labels, batch_parametrisations, output_batch_points, output_batch_parametrisations
 
-        points_co = torch.cat(batch_points, dim=0).to(self.args.device)
-        points_la = torch.cat(batch_labels, dim=0).to(self.args.device)
+    def get_prompts(self, prev_masks, label):
+        
+        if self.args.input_gran_bool:
+            raise NotImplementedError('Need to implement for the situation where there is input graularity prompt')
 
-        self.click_points.append(points_co)
-        self.click_labels.append(points_la)
+            # if self.args.input_sparse_bool:
+        if not self.args.input_gran_bool and self.args.output_gran_bool:
+            #In this case there is not input granularity, only granularity for the mask (metric).
+        
+            batch_points, batch_labels, _, batch_output_points, batch_output_parametrisations = self.get_next_click3D_torch_2(prev_masks, label)
 
-        points_input = points_co
-        labels_input = points_la
+    
+            points_co = torch.cat(batch_points, dim=0).to(self.args.device)
+            points_la = torch.cat(batch_labels, dim=0).to(self.args.device)
 
-        bbox_coords = _bbox_mask(label[:, 0, :]).to(self.args.device) if self.args.use_box else None
-        return points_input, labels_input, bbox_coords
+            self.click_points.append(points_co)
+            self.click_labels.append(points_la)
 
+            points_input = points_co
+            labels_input = points_la
+
+            bbox_coords = _bbox_mask(label[:, 0, :]).to(self.args.device) if self.args.use_box else None
+            return points_input, labels_input, bbox_coords
+        
+        elif not self.input_gran_bool and not self.args.output_gran_bool:
+            #Default case where we are not computing any metrics or inference with granularity info.
+
+            batch_points, batch_labels, _, _, _  = self.get_next_click3D_torch_2(prev_masks, label)
+
+    
+            points_co = torch.cat(batch_points, dim=0).to(self.args.device)
+            points_la = torch.cat(batch_labels, dim=0).to(self.args.device)
+
+            self.click_points.append(points_co)
+            self.click_labels.append(points_la)
+
+            points_input = points_co
+            labels_input = points_la
+
+            bbox_coords = _bbox_mask(label[:, 0, :]).to(self.args.device) if self.args.use_box else None
+            return points_input, labels_input, bbox_coords
+        
 
     def batch_forward(self, sam_model, features, image_embedding, image, prev_masks, points=None, boxes=None):
         prev_masks = F.interpolate(prev_masks, scale_factor=0.25)
@@ -424,7 +573,7 @@ class Tester(object):
         for iter_num in range(self.args.iter_nums):
             prev_masks_sigmoid = torch.sigmoid(prev_masks) if iter_num > 0 else prev_masks
 
-            points_input, labels_input, bbox_input = self.get_points(prev_masks_sigmoid, label)
+            points_input, labels_input, bbox_input = self.get_prompts(prev_masks_sigmoid, label)
             mask, pred_dice = self.batch_forward(sam_model, feature_list, image_embedding, image, prev_masks, points=[points_input, labels_input], boxes=bbox_input)
 
             if self.args.multiple_outputs:
@@ -435,7 +584,7 @@ class Tester(object):
             # FIXME refine or not
             if self.args.refine and self.args.refine_test:
                 mask_refine, error_map = self.sam.mask_decoder.refine(image, mask_best, [self.click_points, self.click_labels], mask_best.detach())
-                print('dice before refine {} and after {}'.format(
+                self.logger.info('dice before refine {} and after {}'.format(
                     self.get_dice_score(torch.sigmoid(mask_best), label),
                     self.get_dice_score(torch.sigmoid(mask_refine), label))
                 )
@@ -443,14 +592,15 @@ class Tester(object):
 
             prev_masks = mask_best
             dice = self.get_dice_score(torch.sigmoid(prev_masks).cpu().numpy(), label.cpu().numpy())
-            print('---')
-            print(f'Dice: {dice:.4f}, pred_dice: {pred_best_dice}, label: {labels_input}')
+            self.logger.info('---')
+            self.logger.info(f'Dice: {dice:.4f}, pred_dice: {pred_best_dice}, label: {labels_input}')
 
         return prev_masks
 
 
 
     def _interaction(self, sam_model, image, label, iter_nums, train=False, return_each_iter=False): #This is for the sliding window inference validation (PRISM original implementation.)
+        raise NotImplementedError('Requires modification in-line with new metrics')
         if return_each_iter:
             return_mask_total_iter = torch.zeros([iter_nums, 1, image.size(2), image.size(3), image.size(4)])
 
@@ -475,7 +625,7 @@ class Tester(object):
             else:
                 label_sample = label
 
-            points_input, labels_input, box_input = self.get_points(prev_masks_sigmoid, label_sample, label)
+            points_input, labels_input, box_input = self.get_prompts(prev_masks_sigmoid, label_sample, label)
             mask, dice_pred = self.batch_forward(sam_model, feature_list, image_embedding, image, prev_masks, points=[points_input, labels_input], boxes=box_input)
 
             # ========================================================
@@ -528,7 +678,21 @@ class Tester(object):
             dice_list.append(compute_dice(pred_masks[i], true_masks[i]))
         return (sum(dice_list) / len(dice_list)).item()
 
+    def metric_mask_init(self, args):
+        return point_mask(args.click_map_type, args.gt_map_type, args.human_measure, args.integer_codes, args.metric_ignore_empty)
+    
 
+    def metric_mask_generator(self, points, gt):
+
+        return self.mask_gen(points, points_parametrisations, include_background, human_measure_information, gt.size(), gt)
+    
+    def point_spatial_parametrisation(self, prev_mask, points, gt):
+        
+        if self.point_param_fixed == True:
+            points_params = dict()
+            for point in points:
+                points_params
+        return 
 
 
 def main():
